@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import axios from 'axios';
 import { Link } from 'react-router-dom';
 
-function UploadForm() {
+function UploadForm({ onClose }) {
     const [filesToUpload, setFilesToUpload] = useState([]);
     const [password, setPassword] = useState('');
 
@@ -46,7 +46,7 @@ function UploadForm() {
 
         if (force) formData.append('force', 'true');
 
-        return axios.post('http://10.8.52.22:3001/api/upload', formData, {
+        return axios.post('http://10.100.102.20:3001/api/upload', formData, {
             headers: {
                 'Content-Type': 'multipart/form-data',
                 'x-admin-password': password,
@@ -55,7 +55,7 @@ function UploadForm() {
     };
 
     useEffect(() => {
-        axios.get('http://10.8.52.22:3001/api/admin/storage-settings', {
+        axios.get('http://10.100.102.20:3001/api/admin/storage-settings', {
             headers: { 'x-access-token': localStorage.getItem('archive_token') }
         }).then(res => setStorageData(res.data))
             .catch(err => console.error("Failed to fetch storage info", err));
@@ -70,7 +70,7 @@ function UploadForm() {
     }, []);
 
     useEffect(() => {
-        axios.get('http://10.8.52.22:3001/api/files', {
+        axios.get('http://10.100.102.20:3001/api/files', {
             headers: { 'x-access-token': localStorage.getItem('archive_token') }
         }).then(res => setAllFiles(res.data));
     }, []);
@@ -202,13 +202,13 @@ function UploadForm() {
     };
 
     return (
-        <div style={{ maxWidth: '600px', margin: '20px auto', padding: '20px', border: '1px solid #ccc', borderRadius: '8px', position: 'relative' }}>
+        <div style={{ maxWidth: '600px', margin: '20px auto', padding: '20px', border: '1px solid #ccc', background: '#333', borderRadius: '8px', position: 'relative', textAlign: 'center' }}>
 
             <h2>העלאת תיקייה לארכיון</h2>
 
             <form onSubmit={handleUpload}>
-                <div style={{ marginBottom: '20px', padding: '15px', background: '#f9f9f9', border: '1px dashed #999' }}>
-                    <label style={{ display: 'block', marginBottom: '10px', fontWeight: 'bold' }}>1. בחר תיקייה לסריקה:</label>
+                <div style={{ marginBottom: '20px', padding: '15px', border: '1px dashed #999' }}>
+                    <label style={{ display: 'block', marginBottom: '10px', fontWeight: 'bold' }}> בחר תיקייה לסריקה:</label>
                     <input type="file" ref={fileInputRef} onChange={handleFileSelect} webkitdirectory="true" directory="" multiple style={{ width: '100%' }} />
                     {filesToUpload.length > 0 && <p style={{ color: 'blue' }}>נבחרו {filesToUpload.length} קבצים</p>}
                 </div>
@@ -399,21 +399,15 @@ function UploadForm() {
                 ))}
             </div>
 
-            {/* כפתור חזרה - מיקום קבוע למטה בשמאל */}
-            <Link to="/" style={{ position: 'fixed', bottom: '20px', left: '20px', zIndex: 1000 }}>
-                <button style={{
-                    padding: '10px 20px',
-                    fontSize: '1rem',
-                    cursor: 'pointer',
-                    backgroundColor: '#333',
-                    color: 'white',
-                    border: 'none',
-                    borderRadius: '30px',
-                    boxShadow: '0 4px 10px rgba(0,0,0,0.3)'
-                }}>
-                    🏠 חזרה לגלריה
-                </button>
-            </Link>
+            {/* כפתור סגירת המודאל */}
+            <button type="button" onClick={onClose} style={{
+                position: 'absolute', top: '15px', left: '15px', zIndex: 1000,
+                padding: '8px 15px', fontSize: '1rem', cursor: 'pointer',
+                backgroundColor: '#dc3545', color: 'white', border: 'none',
+                borderRadius: '5px', boxShadow: '0 4px 10px rgba(0,0,0,0.3)'
+            }}>
+                ✖ סגור
+            </button>
         </div>
     );
 }

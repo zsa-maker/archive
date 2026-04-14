@@ -12,8 +12,8 @@ const archiver = require('archiver');
 const checkDiskSpace = require('check-disk-space').default;
 
 // --- CONFIGURATION ---
-const SERVER_IP = '10.8.52.22';
-const SHARED_FOLDER_PATH = 'Z:';
+const SERVER_IP = '10.100.102.20';
+const SHARED_FOLDER_PATH = 'C:/ArchiveAccess';
 let STORAGE_ROOT = 'C:/MyArchiveData';
 let BACKUP_ROOT = 'D:/BackupArchive';
 const ADMIN_PASSWORD = '123';
@@ -31,7 +31,44 @@ app.use(express.urlencoded({ extended: true }));
 
 // --- DATABASE INIT ---
 const Database = require('better-sqlite3');
-const db = new Database('archive.db');
+let dbFolder = process.cwd();
+try {
+    const electron = require('electron');
+    if (electron && electron.app) {
+        dbFolder = electron.app.getPath('userData'); // שומר את הנתונים בתיקיית AppData הבטוחה
+    }
+} catch (e) {
+    console.warn("Not running in Electron, using permanent DB path");
+    // שמירה בטוחה בתיקייה קבועה בתוך כונן האחסון
+    dbFolder = path.join(STORAGE_ROOT, 'system_db');
+}
+
+// יצירת התיקייה במידה והיא לא קיימת
+if (!fs.existsSync(dbFolder)) {
+    fs.mkdirSync(dbFolder, { recursive: true });
+}
+
+const db = new Database(path.join(dbFolder, 'archive.db'));
+const settingsDb = new Datastore({ filename: path.join(dbFolder, 'settings.db'), autoload: true });
+const ipsDb = new Datastore({ filename: path.join(dbFolder, 'allowed_ips.db'), autoload: true });
+
+// --- CLIENT BUILD PATH SETUP ---
+let clientBuildPath = '';
+const possiblePaths = [
+    path.join(__dirname, 'archive-client', 'build'),
+    path.join(__dirname, 'build'),
+    path.join(process.resourcesPath, 'archive-client', 'build'),
+    path.join(process.resourcesPath, 'build')
+];
+
+for (const testPath of possiblePaths) {
+    if (fs.existsSync(testPath)) {
+        clientBuildPath = testPath;
+        break;
+    }
+}
+console.log('✅ Final Build Path:', clientBuildPath);
+// --- END OF CLIENT BUILD PATH SETUP ---
 
 // יצירת הטבלה אם היא לא קיימת
 db.exec(`
@@ -65,13 +102,10 @@ db.exec(`
 `);
 
 // יצירת אינדקסים - מאיץ את טעינת התמונות פי 100!
-
-const settingsDb = new Datastore({ filename: 'settings.db', autoload: true });
-const ipsDb = new Datastore({ filename: 'allowed_ips.db', autoload: true });
 const ARCHIVE_FOLDER_NAME = 'MyArchiveData';
 
 // --- IP MANAGEMENT ---
-let dynamicAllowedIps = ['127.0.0.1', '10.8.52.22'];
+let dynamicAllowedIps = ['127.0.0.1', '::1', 'localhost', '10.100.102.20'];
 
 ipsDb.find({}, (err, docs) => {
     if (!err) docs.forEach(doc => {
@@ -87,7 +121,15 @@ settingsDb.findOne({ key: 'config' }, (err, doc) => {
     }
 });
 
-const ffmpegPath = path.join(__dirname, 'ffmpeg.exe');
+let ffmpegPath = app.isPackaged
+    ? path.join(process.resourcesPath, 'ffmpeg.exe')
+    : path.join(__dirname, 'ffmpeg.exe');
+
+// Add a check to ensure the file exists
+if (!fs.existsSync(ffmpegPath)) {
+    console.error("❌ FFmpeg not found at:", ffmpegPath);
+}
+
 ffmpeg.setFfmpegPath(ffmpegPath);
 
 const processingQueue = [];
@@ -109,9 +151,8 @@ async function processNext() {
         await processMediaInBackground(item);
     } catch (err) {
         console.error("Error processing:", err);
-    } finally {
-        activeProcessors--;
-        processNext();
+        // עדכון הסטטוס ל-error כדי שלא ייתקע לנצח
+        db.prepare("UPDATE files SET processingStatus = 'error' WHERE id = ?").run(item.id);
     }
 }
 
@@ -164,6 +205,8 @@ async function buildDatabaseFromDrives() {
 async function scanDir(dir) {
     let count = 0;
     const items = fs.readdirSync(dir);
+    // הגדרת סיומות של קובצי מדיה שנסרוק (מתעלם מקבצי מערכת)
+    const validExts = ['.jpg', '.jpeg', '.png', '.gif', '.mp4', '.mov', '.webm', '.mxf'];
 
     for (const item of items) {
         const fullPath = path.join(dir, item);
@@ -171,39 +214,69 @@ async function scanDir(dir) {
 
         if (stat.isDirectory()) {
             count += await scanDir(fullPath);
-        } else if (item.endsWith('.meta.json')) {
-            const meta = JSON.parse(fs.readFileSync(fullPath, 'utf8'));
-            const actualFile = fullPath.replace('.meta.json', '');
+        } else {
+            const ext = path.extname(item).toLowerCase();
 
-            if (fs.existsSync(actualFile)) {
-                meta.absolutePath = actualFile.replace(/\\/g, '/');
-                delete meta._id; // יצירת מזהה חדש בזיכרון
+            // נבדוק אם זה קובץ מדיה (ולא נסרוק את קבצי התמונות הממוזערות של המערכת)
+            if (validExts.includes(ext) && !item.startsWith('thumb_') && !item.startsWith('stream_')) {
+                const baseName = path.basename(item, ext);
+                const expectedMeta = path.join(dir, `${baseName}.meta.json`);
+
+                let meta = {};
+
+                // אם יש קובץ meta, נקרא אותו
+                if (fs.existsSync(expectedMeta)) {
+                    try {
+                        meta = JSON.parse(fs.readFileSync(expectedMeta, 'utf8'));
+                    } catch (e) { console.error("Error reading meta:", expectedMeta); }
+                } else {
+                    // קובץ יתום (מתמונות ישנות) - נשחזר אותו למסד הנתונים!
+                    meta = {
+                        id: require('uuid').v4(),
+                        fileHash: baseName,
+                        originalName: item,
+                        mimeType: ext === '.mp4' || ext === '.mov' ? 'video/mp4' : 'image/jpeg',
+                        absolutePath: fullPath.replace(/\\/g, '/'),
+                        path: `storage/${path.relative(STORAGE_ROOT, fullPath).replace(/\\/g, '/')}`,
+                        eventName: path.basename(dir), // לוקח אוטומטית את שם התיקייה כשם האירוע
+                        uploadDate: stat.birthtime.toISOString(),
+                        processingStatus: 'done',
+                        isBackedUp: 0
+                    };
+                    // ניצור לו קובץ meta חדש כדי שלא ייעלם בעתיד
+                    fs.writeFileSync(expectedMeta, JSON.stringify(meta, null, 2));
+                }
+
+                // הכנסה למסד הנתונים של SQLite
                 const insertStmt = db.prepare(`
-                    INSERT OR IGNORE INTO files (id, fileHash, originalName, mimeType, path, absolutePath, uploadDate, framework, population, courseNumber, courseStage, eventName, photographer, period, activeYear, month, description, processingStatus, isBackedUp)
-                    VALUES (@id, @fileHash, @originalName, @mimeType, @path, @absolutePath, @uploadDate, @framework, @population, @courseNumber, @courseStage, @eventName, @photographer, @period, @activeYear, @month, @description, @processingStatus, @isBackedUp)
+                    INSERT OR IGNORE INTO files (id, fileHash, originalName, mimeType, path, absolutePath, uploadDate, framework, population, courseNumber, courseStage, eventName, photographer, period, activeYear, month, description, processingStatus, isBackedUp, streamPath, thumbnailPath)
+                    VALUES (@id, @fileHash, @originalName, @mimeType, @path, @absolutePath, @uploadDate, @framework, @population, @courseNumber, @courseStage, @eventName, @photographer, @period, @activeYear, @month, @description, @processingStatus, @isBackedUp, @streamPath, @thumbnailPath)
                 `);
 
                 insertStmt.run({
                     id: meta.id || require('uuid').v4(),
-                    fileHash: meta.fileHash || '',
-                    originalName: meta.originalName || '',
+                    fileHash: meta.fileHash || baseName,
+                    originalName: meta.originalName || item,
                     mimeType: meta.mimeType || '',
                     path: meta.path || '',
-                    absolutePath: meta.absolutePath || '',
+                    absolutePath: meta.absolutePath || fullPath.replace(/\\/g, '/'),
                     uploadDate: meta.uploadDate || new Date().toISOString(),
                     framework: meta.framework || '',
                     population: meta.population || '',
                     courseNumber: meta.courseNumber || '',
                     courseStage: meta.courseStage || '',
-                    eventName: meta.eventName || 'ללא שם',
+                    eventName: meta.eventName || path.basename(dir),
                     photographer: meta.photographer || '',
                     period: meta.period || '',
                     activeYear: meta.activeYear || '',
                     month: meta.month || '',
                     description: meta.description || '',
                     processingStatus: meta.processingStatus || 'done',
-                    isBackedUp: meta.isBackedUp || 0
-                }); count++;
+                    isBackedUp: meta.isBackedUp || 0,
+                    streamPath: meta.streamPath || null,      // התווסף
+                    thumbnailPath: meta.thumbnailPath || null // התווסף
+                });
+                count++;
             }
         }
     }
@@ -360,6 +433,13 @@ app.post('/api/upload', protectApi, multer({ dest: path.join(STORAGE_ROOT, 'temp
             isBackedUp: 0
         };
 
+        try {
+            const metaPath = path.join(finalDir, `${fileHash}.meta.json`);
+            fs.writeFileSync(metaPath, JSON.stringify(newItem, null, 2));
+        } catch (metaErr) {
+            console.error("Failed to write meta.json", metaErr);
+        }
+
         // הכנסה ל-SQLite
         const insert = db.prepare(`
             INSERT INTO files (id, fileHash, originalName, mimeType, path, absolutePath, uploadDate, framework, population, courseNumber, courseStage, eventName, photographer, period, activeYear, month, description, processingStatus, isBackedUp)
@@ -383,19 +463,27 @@ app.post('/api/upload', protectApi, multer({ dest: path.join(STORAGE_ROOT, 'temp
 
 // Helper function to get disk space safely
 async function getDiskInfo(drivePath) {
-    if (!drivePath) return { freeGB: 0, totalGB: 0, percent: 0, status: 'unknown' };
+    if (!drivePath) return { freeGB: 0, totalGB: 0, usedGB: 0, usedPercent: 0, percent: 0, status: 'unknown' };
     try {
         const root = path.parse(drivePath).root;
         const info = await checkDiskSpace(root);
+
+        const freeGB = (info.free / (1024 ** 3)).toFixed(1);
+        const totalGB = (info.size / (1024 ** 3)).toFixed(1);
+        const usedGB = (totalGB - freeGB).toFixed(1);
+        const usedPercent = (((info.size - info.free) / info.size) * 100).toFixed(1);
+
         return {
             path: drivePath,
-            freeGB: (info.free / (1024 ** 3)).toFixed(1),
-            totalGB: (info.size / (1024 ** 3)).toFixed(1),
-            percent: ((info.free / info.size) * 100).toFixed(1),
+            freeGB,
+            totalGB,
+            usedGB,
+            usedPercent,
+            percent: ((info.free / info.size) * 100).toFixed(1), // free percent
             status: 'online'
         };
     } catch (e) {
-        return { path: drivePath, freeGB: 0, totalGB: 0, percent: 0, status: 'offline' };
+        return { path: drivePath, freeGB: 0, totalGB: 0, usedGB: 0, usedPercent: 0, percent: 0, status: 'offline' };
     }
 }
 
@@ -406,28 +494,35 @@ app.get('/api/admin/storage-settings', protectApi, async (req, res) => {
         const pastStorage = settings.storage_history || [];
         const pastBackup = settings.backup_history || [];
 
+        // שליפת כוננים שהוגדרו ידנית במערכת
+        const configuredSources = await settingsDb.findAsync({ type: 'source' });
+        const configuredBackups = await settingsDb.findAsync({ type: 'backup' });
+
+        const sourcePaths = configuredSources.map(d => d.path);
+        const backupPaths = configuredBackups.map(d => d.path);
+
         // 1. מידע על כונן ראשי נוכחי
         const currentSpace = await getDiskInfo(STORAGE_ROOT);
 
         // 2. מידע על כונן גיבוי נוכחי
         const backupSpaceInfo = await getDiskInfo(BACKUP_ROOT);
 
-        // 3. מידע על היסטוריית כונני העלאה
-        // מוסיפים גם כוננים שיש להם קבצים ב-DB אבל אולי לא בהיסטוריה
+        // 3. איחוד כלל כונני המקור
         const allFiles = db.prepare('SELECT * FROM files').all();
         const fileDrives = [...new Set(allFiles.map(f => f.absolutePath ? path.parse(f.absolutePath).root : null))].filter(Boolean);
-        const unifiedStorageHistory = [...new Set([...pastStorage, ...fileDrives])];
 
+        const unifiedStorageHistory = [...new Set([...pastStorage, ...fileDrives, ...sourcePaths, STORAGE_ROOT])].filter(Boolean);
         const storageHistoryInfo = await Promise.all(unifiedStorageHistory.map(p => getDiskInfo(p)));
 
-        // 4. מידע על היסטוריית כונני גיבוי
-        const backupHistoryInfo = await Promise.all(pastBackup.map(p => getDiskInfo(p)));
+        // 4. איחוד כלל כונני הגיבוי
+        const unifiedBackupHistory = [...new Set([...pastBackup, ...backupPaths, BACKUP_ROOT])].filter(Boolean);
+        const backupHistoryInfo = await Promise.all(unifiedBackupHistory.map(p => getDiskInfo(p)));
 
         res.json({
             currentPath: STORAGE_ROOT,
             backupPath: BACKUP_ROOT,
             currentSpace,
-            backupSpace: backupSpaceInfo, // תיקון ה-NaN
+            backupSpace: backupSpaceInfo,
             storageHistory: storageHistoryInfo,
             backupHistory: backupHistoryInfo
         });
@@ -478,60 +573,28 @@ app.post('/api/admin/migrate-drive', protectApi, async (req, res) => {
         const normalizedOld = path.resolve(oldDrive).replace(/\\/g, '/');
         const normalizedNew = path.resolve(newDrive).replace(/\\/g, '/');
 
-        if (normalizedOld === normalizedNew) return res.status(400).json({ error: 'Same path' });
-
-        // מציאת כל הקבצים שיושבים פיזית בכונן הישן
         const allFiles = db.prepare('SELECT * FROM files').all();
         const filesToMove = allFiles.filter(f => f.absolutePath && f.absolutePath.replace(/\\/g, '/').startsWith(normalizedOld));
 
         let movedCount = 0;
-
-        // פונקציית עזר להעתקה ומחיקה אסינכרונית (כדי לא לתקוע את השרת בזמן העברה ארוכה)
-        const copyAndDel = async (src, dest) => {
-            if (fs.existsSync(src)) {
-                const dir = path.dirname(dest);
-                if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-                await fs.promises.copyFile(src, dest);
-                await fs.promises.unlink(src); // מחיקת המקור לאחר ההעתקה
-            }
-        };
-
         for (const f of filesToMove) {
             const oldAbs = f.absolutePath.replace(/\\/g, '/');
             const newAbs = oldAbs.replace(normalizedOld, normalizedNew);
 
-            // 1. העברת הקובץ המקורי
-            await copyAndDel(oldAbs, newAbs);
-
-            // 2. העברת התמונה הממוזערת (Thumb) אם קיימת
-            if (f.thumbnailPath) {
-                const thumbName = path.basename(f.thumbnailPath);
-                await copyAndDel(path.join(path.dirname(oldAbs), thumbName), path.join(path.dirname(newAbs), thumbName));
+            // העברת קבצים פיזית
+            if (fs.existsSync(oldAbs)) {
+                const dir = path.dirname(newAbs);
+                if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+                fs.copyFileSync(oldAbs, newAbs);
+                fs.unlinkSync(oldAbs);
             }
 
-            // 3. העברת סרטון הסטרימינג (Stream) אם קיים
-            if (f.streamPath) {
-                const streamName = path.basename(f.streamPath);
-                await copyAndDel(path.join(path.dirname(oldAbs), streamName), path.join(path.dirname(newAbs), streamName));
-            }
-
-            // 4. עדכון הנתיב המוחלט במסד הנתונים
-            await db.updateAsync({ _id: f._id }, { $set: { absolutePath: newAbs } });
+            // עדכון SQLite - שים לב לשימוש ב-id ולא _id
+            db.prepare('UPDATE files SET absolutePath = ? WHERE id = ?').run(newAbs, f.id);
             movedCount++;
         }
 
-        // עדכון היסטוריית הכוננים: מחיקת הישן והוספת החדש
-        await settingsDb.updateAsync({ key: 'config' }, { $pull: { storage_history: normalizedOld } });
-        await settingsDb.updateAsync({ key: 'config' }, { $addToSet: { storage_history: normalizedNew } }, { upsert: true });
-
-        // אם הכונן הישן היה מוגדר ככונן ההעלאות הראשי הנוכחי, נחליף גם אותו
-        if (STORAGE_ROOT === normalizedOld) {
-            STORAGE_ROOT = normalizedNew;
-            await settingsDb.updateAsync({ key: 'config' }, { $set: { storage_root: STORAGE_ROOT } });
-        }
-
-        res.json({ success: true, message: 'Migration started in background' });
-        runMigrationTask(filesToMove, normalizedOld, normalizedNew);
+        res.json({ success: true, movedCount });
     } catch (e) {
         console.error("Migration error: ", e);
         res.status(500).json({ error: 'Migration failed' });
@@ -602,9 +665,9 @@ app.post('/api/admin/run-backup', protectApi, async (req, res) => {
                 if (!fs.existsSync(destPath)) {
                     fs.copyFileSync(file.absolutePath, destPath);
                     copied++;
-                    await db.updateAsync({ _id: file._id }, { $set: { isBackedUp: true } });
+                    await db.updateAsync({ id: file.id }, { $set: { isBackedUp: true } });
                 } else {
-                    await db.updateAsync({ _id: file._id }, { $set: { isBackedUp: true } });
+                    await db.updateAsync({ id: file.id }, { $set: { isBackedUp: true } });
                 }
             }
         }
@@ -629,12 +692,25 @@ app.post('/api/admin/refresh-drives', protectApi, async (req, res) => {
     const adminPass = req.headers['x-admin-password'];
     if (adminPass !== ADMIN_PASSWORD) return res.status(403).json({ error: 'Wrong Password' });
 
-    // מוחק את מסד הנתונים מהזיכרון, וסורק הכל מחדש מהכוננים שמחוברים עכשיו!
+    console.log("🛠️ מבצע גיבוי נתוני Meta לפני רענון...");
+    // גיבוי הצלה: לפני שמוחקים, נייצר קבצי meta.json לכל מה שכבר קיים במסד הנתונים!
+    const allFiles = db.prepare('SELECT * FROM files').all();
+    for (const file of allFiles) {
+        if (file.absolutePath && fs.existsSync(file.absolutePath)) {
+            const metaPath = path.join(path.dirname(file.absolutePath), `${file.fileHash}.meta.json`);
+            if (!fs.existsSync(metaPath)) {
+                fs.writeFileSync(metaPath, JSON.stringify(file, null, 2));
+            }
+        }
+    }
+
+    // עכשיו בטוח למחוק ולסרוק מחדש
     db.prepare('DELETE FROM files').run();
     await buildDatabaseFromDrives();
 
     res.json({ success: true });
 });
+
 // --- שאר הפונקציות (IP, DELETE...) ---
 app.get('/api/admin/ips', protectApi, (req, res) => {
     ipsDb.find({}, (err, docs) => {
@@ -667,11 +743,11 @@ app.delete('/api/event', protectApi, async (req, res) => {
     const { eventName } = req.query;
     if (req.headers['x-admin-password'] !== ADMIN_PASSWORD) return res.status(403).json({ error: 'Wrong Pass' });
     try {
-        const eventFiles = await db.findAsync({ eventName });
+        const eventFiles = db.prepare('SELECT * FROM files WHERE eventName = ?').all(eventName);
         for (const file of eventFiles) {
             if (fs.existsSync(file.absolutePath)) fs.unlinkSync(file.absolutePath);
         }
-        await db.removeAsync({ eventName }, { multi: true });
+        db.prepare('DELETE FROM files WHERE eventName = ?').run(eventName);
         res.json({ success: true });
     } catch (err) { res.status(500).json({ error: 'Delete failed' }); }
 });
@@ -679,14 +755,15 @@ app.delete('/api/event', protectApi, async (req, res) => {
 app.put('/api/event/rename', protectApi, async (req, res) => {
     const { oldName, newName } = req.body;
     if (req.headers['x-admin-password'] !== ADMIN_PASSWORD) return res.status(403).json({ error: 'Wrong Pass' });
-    await db.updateAsync({ eventName: oldName }, { $set: { eventName: newName } }, { multi: true });
+    db.prepare('UPDATE files SET eventName = ? WHERE eventName = ?').run(newName, oldName);
     res.json({ success: true });
 });
 
 app.post('/api/files/move', protectApi, async (req, res) => {
     const { ids, newEventName } = req.body;
     if (req.headers['x-admin-password'] !== ADMIN_PASSWORD) return res.status(403).json({ error: 'Wrong Pass' });
-    await db.updateAsync({ _id: { $in: ids } }, { $set: { eventName: newEventName } }, { multi: true });
+    const placeholders = ids.map(() => '?').join(',');
+    db.prepare(`UPDATE files SET eventName = ? WHERE id IN (${placeholders})`).run(newEventName, ...ids);
     res.json({ success: true });
 });
 
@@ -712,6 +789,37 @@ app.post('/api/download-zip', protectApi, async (req, res) => {
         }
     }
     archive.finalize();
+});
+
+// New middleware: Only allows local requests with the correct admin password
+const protectAdminLocal = (req, res, next) => {
+    const clientIp = req.ip.replace('::ffff:', '');
+    const isLocal = clientIp === '127.0.0.1' || clientIp === '::1' || clientIp === 'localhost';
+    const sentPassword = req.headers['x-admin-password'];
+
+    // Only allow if it's the main computer AND the password is correct
+    if (isLocal && sentPassword === ADMIN_PASSWORD) {
+        next();
+    } else {
+        console.warn(`Unauthorized Admin Attempt from IP: ${clientIp}`);
+        res.status(403).json({ error: 'Access Denied: Action only allowed on the Main Computer.' });
+    }
+};
+
+// API to manually regenerate the D:/Open_Archive.html access file
+app.post('/api/admin/regenerate-access-file', protectAdminLocal, async (req, res) => {
+    try {
+        // Ensure the directory exists before writing
+        if (!fs.existsSync(SHARED_FOLDER_PATH)) {
+            fs.mkdirSync(SHARED_FOLDER_PATH, { recursive: true });
+        }
+
+        createAccessFile(); // Re-runs the existing file generation logic
+        res.json({ success: true, message: 'Access file successfully regenerated on D: drive.' });
+    } catch (err) {
+        console.error("Failed to regenerate access file:", err);
+        res.status(500).json({ error: 'Failed to create access file' });
+    }
 });
 
 function getFileHash(filePath) {
@@ -741,7 +849,7 @@ async function runWeeklyBackup() {
 }
 
 // הפעלה כל 7 ימים
-setInterval(runWeeklyBackup, 7 * 24 * 60 * 60 * 1000);
+setInterval(runWeeklyBackup, 24 * 60 * 60 * 1000);
 
 function copyRecursiveSync(src, dest) {
     if (!fs.existsSync(src)) return;
@@ -757,11 +865,43 @@ function copyRecursiveSync(src, dest) {
 setInterval(runWeeklyBackup, 7 * 24 * 60 * 60 * 1000);
 
 function createAccessFile() {
-    const fileContent = `<html><body style="background:#222;color:white;text-align:center;padding-top:50px"><h1>Loading...</h1><script>window.location.href="http://${SERVER_IP}:${PORT}/?token=${SESSION_TOKEN}";</script></body></html>`;
-    if (fs.existsSync(SHARED_FOLDER_PATH)) fs.writeFileSync(path.join(SHARED_FOLDER_PATH, 'Open_Archive.html'), fileContent);
-}
+    // We point the favicon to the server's storage route to load the icon dynamically
+    const faviconUrl = `http://${SERVER_IP}:${PORT}/storage/icon.ico?token=${SESSION_TOKEN}`;
 
-const clientBuildPath = path.join(__dirname, 'archive-client', 'build');
+    const fileContent = `
+    <html>
+    <head>
+        <title>Archive Dashboard</title>
+        <link rel="icon" type="image/x-icon" href="${faviconUrl}">
+        <style>
+            body { background: #222; color: white; text-align: center; padding-top: 100px; font-family: sans-serif; }
+            .loader { border: 4px solid #f3f3f3; border-top: 4px solid #3498db; border-radius: 50%; width: 40px; height: 40px; animation: spin 2s linear infinite; margin: 20px auto; }
+            @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        </style>
+    </head>
+    <body>
+        <img src="${faviconUrl}" style="width:100px; margin-bottom:20px;" alt="Logo">
+        <h1>Connecting to Archive...</h1>
+        <div class="loader"></div>
+        <script>
+            // Automatically redirect to the main dashboard
+            window.location.href = "http://${SERVER_IP}:${PORT}/?token=${SESSION_TOKEN}";
+        </script>
+    </body>
+    </html>`;
+
+    try {
+        // עכשיו הבדיקה נמצאת במקום הנכון! 
+        if (!fs.existsSync(SHARED_FOLDER_PATH)) {
+            fs.mkdirSync(SHARED_FOLDER_PATH, { recursive: true });
+        }
+
+        fs.writeFileSync(path.join(SHARED_FOLDER_PATH, 'Open_Archive.html'), fileContent);
+        console.log("✅ קובץ הגישה (Open_Archive.html) נוצר/עודכן בהצלחה בכונן D!");
+    } catch (err) {
+        console.error("❌ שגיאה ביצירת קובץ הגישה. ייתכן שאין הרשאות או שכונן D לא זמין:", err.message);
+    }
+}
 
 console.log('--- Client Serving Debug ---');
 console.log('Looking for build at:', clientBuildPath);
@@ -786,7 +926,7 @@ try {
         const transaction = db.transaction((data) => {
             for (const item of data) {
                 insert.run(
-                    item._id,
+                    item.id,
                     item.originalName,
                     item.absolutePath,
                     item.streamPath || null,
@@ -809,6 +949,11 @@ try {
 }
 
 app.get(/.*/, (req, res) => {
+    // Don't intercept API routes
+    if (req.path.startsWith('/api/') || req.path.startsWith('/storage/')) {
+        return res.status(404).json({ error: 'API route not found' });
+    }
+
     const indexPath = path.join(clientBuildPath, 'index.html');
     if (fs.existsSync(indexPath)) {
         res.sendFile(indexPath);
@@ -851,8 +996,8 @@ async function processMediaInBackground(item) {
                     .on('end', resolve)
                     .on('error', reject)
                     .screenshots({
-                        timestamps: ['00:00:01'],
-                        filename: path.basename(thumbPath),
+                        timestamps: ['10%'],
+                        filename: `thumb_${item.fileHash}.jpg`, // 👈 ADD THIS LINE
                         folder: path.dirname(thumbPath),
                         size: '320x?'
                     });
@@ -886,6 +1031,15 @@ async function processMediaInBackground(item) {
                     WHERE id = ?
                 `);
                 updateStmt.run(relStream, relThumb, item.id);
+
+                const metaPath = path.join(outputDir, `${item.fileHash}.meta.json`);
+                if (fs.existsSync(metaPath)) {
+                    const metaData = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+                    metaData.streamPath = relStream;
+                    metaData.thumbnailPath = relThumb;
+                    metaData.processingStatus = 'done';
+                    fs.writeFileSync(metaPath, JSON.stringify(metaData, null, 2));
+                }
             }
 
         } else if (item.mimeType.startsWith('image')) {
@@ -914,17 +1068,35 @@ async function processMediaInBackground(item) {
         throw e;
     }
 }
-// בתוך הקובץ server.js - עדכון פונקציית ה-listen בסוף הקובץ
-app.listen(PORT, async () => {
-    // יצירת תיקיית הבסיס ותיקיית temp אם הן לא קיימות
-    const tempPath = path.join(STORAGE_ROOT, 'temp');
-    if (!fs.existsSync(tempPath)) {
-        fs.mkdirSync(tempPath, { recursive: true });
+
+// בתוך server.js בסוף הקובץ
+const server = app.listen(PORT, async () => {
+    try {
+        const tempPath = path.join(STORAGE_ROOT, 'temp');
+        if (!fs.existsSync(tempPath)) fs.mkdirSync(tempPath, { recursive: true });
+
+        createAccessFile();
+        console.log(`✅ Server running at http://${SERVER_IP}:${PORT}`);
+
+        // עטוף את הסריקה כדי ששגיאה בכונן לא תפיל את כל השרת
+        try {
+            await buildDatabaseFromDrives();
+        } catch (scanErr) {
+            console.error("❌ שגיאה בסריקת כוננים:", scanErr);
+        }
+    } catch (err) {
+        console.error("❌ שגיאה קריטית בעליית השרת:", err);
     }
-
-    createAccessFile();
-    console.log(`Server running at http://${SERVER_IP}:${PORT}`);
-
-    // סריקה אוטומטית של כוננים רשומים בלבד
-    // await buildDatabaseFromDrives();
 });
+
+// מאזין לשגיאות בהפעלת השרת (למשל אם הפורט כבר תפוס)
+server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+        console.error(`❌ שגיאה: הפורט ${PORT} כבר תפוס! ייתכן שהשרת כבר רץ ברקע.`);
+    } else {
+        console.error('❌ שגיאה בשרת:', err);
+    }
+});
+
+// EXPORT THE VARIABLES SO ELECTRON CAN READ THEM
+module.exports = { server, PORT, SESSION_TOKEN };

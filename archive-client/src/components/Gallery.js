@@ -1,8 +1,9 @@
 import React, { useEffect, useState, useCallback, useMemo } from 'react';
 import axios from 'axios';
 import { Link } from 'react-router-dom';
+import UploadForm from './UploadForm';
 
-export const API_URL = 'http://10.8.52.22:3001';
+export const API_URL = 'http://10.100.102.20:3001';
 
 function Gallery() {
     const ADMIN_CONFIG = {
@@ -77,6 +78,42 @@ function Gallery() {
         return true;
     };
 
+    const [isLocalHost, setIsLocalHost] = useState(false);
+
+    // מערכת התראות (Toasts)
+    const [toasts, setToasts] = useState([]);
+
+    // שדות קלט עבור חלונות ניהול שמחליפים את חלונות ה-prompt (למניעת תקיעת המקלדת באלקטרון)
+    const [newIpValue, setNewIpValue] = useState('');
+    const [newSourceDriveValue, setNewSourceDriveValue] = useState('');
+    const [newBackupDriveValue, setNewBackupDriveValue] = useState('');
+
+    const addToast = useCallback((msg, type = 'warning') => {
+        const id = Date.now();
+        setToasts(prev => [...prev, { id, msg, type }]);
+        setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 6000);
+    }, []);
+
+    const [isUploadModalOpen, setIsUploadModalOpen] = useState(false);
+
+    useEffect(() => {
+        const host = window.location.hostname;
+        if (host === 'localhost' || host === '127.0.0.1' || host === '::1') {
+            setIsLocalHost(true);
+        }
+    }, []);
+
+    const handleRegenerateAccessFile = async () => {
+        try {
+            const res = await axios.post(`${API_URL}/api/admin/regenerate-access-file`, {}, {
+                headers: { 'x-admin-password': adminPassword } // Uses the password you entered during login
+            });
+            if (res.data.success) alert("✅ הקובץ נוצר בהצלחה בכונן D!");
+        } catch (err) {
+            alert(err.response?.data?.error || "שגיאה ביצירת הקובץ");
+        }
+    };
+
     useEffect(() => {
         fetchFiles();
     }, []);
@@ -91,8 +128,12 @@ function Gallery() {
         }
     }, [files]);
     const triggerProtectedAction = (action, data = null) => {
-        setAuthModal({ isOpen: true, action, data });
-        setAuthInput('');
+        if (isAdmin) {
+            action(data); // מדלג על חלון הסיסמה אם כבר חוברת כמנהל
+        } else {
+            setAuthModal({ isOpen: true, action, data });
+            setAuthInput('');
+        }
     };
 
     const handleAuthConfirm = () => {
@@ -114,8 +155,20 @@ function Gallery() {
             setCurrentStorageRoot(res.data.currentPath);
             if (res.data.backupPath) setBackupPath(res.data.backupPath);
 
-            if (res.data.currentSpace) setStorageSpace(res.data.currentSpace);
-            if (res.data.backupSpace) setBackupSpace(res.data.backupSpace);
+            if (res.data.currentSpace) {
+                setStorageSpace(res.data.currentSpace);
+                // בדיקת 85% תפוסה לכונן הראשי
+                if (parseFloat(res.data.currentSpace.usedPercent) >= 85) {
+                    addToast(`⚠️ שים לב: כונן האחסון הראשי (${res.data.currentSpace.path}) חצה את ה-85% תפוסה!`, 'warning');
+                }
+            }
+            if (res.data.backupSpace) {
+                setBackupSpace(res.data.backupSpace);
+                // בדיקת 85% תפוסה לכונן הגיבוי
+                if (parseFloat(res.data.backupSpace.usedPercent) >= 85) {
+                    addToast(`⚠️ שים לב: כונן הגיבוי (${res.data.backupSpace.path}) חצה את ה-85% תפוסה!`, 'warning');
+                }
+            }
 
             setStorageHistory(res.data.storageHistory || []);
             setBackupHistory(res.data.backupHistory || []);
@@ -123,7 +176,13 @@ function Gallery() {
         } catch (err) {
             console.error("Failed to fetch storage settings");
         }
-    }, []);
+    }, [addToast]);
+
+    // חשוב: נעדכן את ה-useEffect הראשי כך שיקרא לפונקציה הזו מיד בכניסה
+    useEffect(() => {
+        fetchFiles();
+        fetchStorageSettings();
+    }, [fetchStorageSettings]);
 
     const checkBackupSpace = async () => {
         if (!backupPath) return;
@@ -289,19 +348,22 @@ function Gallery() {
 
     const navigateLightbox = useCallback((direction) => {
         if (!previewFile) return;
-        const currentIndex = filteredFiles.findIndex(f => f._id === previewFile._id);
-        if (currentIndex === -1) return;
+
+        // Determine the correct list: if in a folder, use currentFolder.folderFiles
+        const activeList = currentFolder ? currentFolder.folderFiles : filteredFiles;
+
+        const currentIndex = activeList.findIndex(f => (f.id) === (previewFile.id)); if (currentIndex === -1) return;
 
         let newIndex;
         if (direction === 'next') {
             newIndex = currentIndex + 1;
-            if (newIndex >= filteredFiles.length) newIndex = 0;
+            if (newIndex >= activeList.length) newIndex = 0;
         } else {
             newIndex = currentIndex - 1;
-            if (newIndex < 0) newIndex = filteredFiles.length - 1;
+            if (newIndex < 0) newIndex = activeList.length - 1;
         }
-        setPreviewFile(filteredFiles[newIndex]);
-    }, [filteredFiles, previewFile]);
+        setPreviewFile(activeList[newIndex]);
+    }, [filteredFiles, previewFile, currentFolder]);
 
     useEffect(() => {
         const handleKeyDown = (e) => {
@@ -338,38 +400,38 @@ function Gallery() {
     };
 
     // הוסיפי את הבלוק הזה לפני ה-return של הקומפוננטה
-const uniqueFolders = useMemo(() => {
-    const foldersMap = new Map();
+    const uniqueFolders = useMemo(() => {
+        const foldersMap = new Map();
 
-    filteredFiles.forEach(f => {
-        if (!f.eventName) return;
-        
-        // יצירת מפתח ייחודי לפי שם אירוע ושנה
-        const key = `${f.eventName}-${f.activeYear}`;
-        
-        if (!foldersMap.has(key)) {
-            foldersMap.set(key, {
-                ...f,
-                photographers: new Set(f.photographer ? [f.photographer] : []),
-                fileCount: 0,
-                folderFiles: []
-            });
-        }
-    });
+        filteredFiles.forEach(f => {
+            if (!f.eventName) return;
 
-    // שיוך קבצים לתיקיות בסיבוב אחד מהיר
-    files.forEach(f => {
-        const key = `${f.eventName}-${f.activeYear}`;
-        const target = foldersMap.get(key);
-        if (target) {
-            target.fileCount++;
-            target.folderFiles.push(f);
-            if (f.photographer) target.photographers.add(f.photographer);
-        }
-    });
+            // יצירת מפתח ייחודי לפי שם אירוע ושנה
+            const key = `${f.eventName}-${f.activeYear}`;
 
-    return Array.from(foldersMap.values()).sort((a, b) => a.eventName.localeCompare(b.eventName));
-}, [filteredFiles, files]); // עיבוד אופטימלי
+            if (!foldersMap.has(key)) {
+                foldersMap.set(key, {
+                    ...f,
+                    photographers: new Set(f.photographer ? [f.photographer] : []),
+                    fileCount: 0,
+                    folderFiles: []
+                });
+            }
+        });
+
+        // שיוך קבצים לתיקיות בסיבוב אחד מהיר
+        files.forEach(f => {
+            const key = `${f.eventName}-${f.activeYear}`;
+            const target = foldersMap.get(key);
+            if (target) {
+                target.fileCount++;
+                target.folderFiles.push(f);
+                if (f.photographer) target.photographers.add(f.photographer);
+            }
+        });
+
+        return Array.from(foldersMap.values()).sort((a, b) => a.eventName.localeCompare(b.eventName));
+    }, [filteredFiles, files]); // עיבוד אופטימלי
 
     const handleDeleteEvent = async (e, eventName) => {
         e.stopPropagation();
@@ -395,13 +457,21 @@ const uniqueFolders = useMemo(() => {
     const handleBatchDelete = async () => {
         if (!window.confirm(`למחוק ${selectedFiles.size} קבצים?`)) return;
         try {
+            const token = localStorage.getItem('archive_token'); // שליפת הטוקן
             await axios.post(`${API_URL}/api/files/batch-delete`,
                 { ids: Array.from(selectedFiles) },
-                { headers: { 'x-admin-password': adminPassword } }
+                {
+                    headers: {
+                        'x-admin-password': adminPassword,
+                        'x-access-token': token // הוספת הטוקן שחסר
+                    }
+                }
             );
             fetchFiles();
             setSelectedFiles(new Set());
-        } catch (err) { alert("שגיאה במחיקה"); }
+        } catch (err) {
+            alert("שגיאה במחיקה: " + (err.response?.data?.error || err.message));
+        }
     };
 
     const handleMoveFiles = async () => {
@@ -435,14 +505,16 @@ const uniqueFolders = useMemo(() => {
     };
 
     // --- הורדת תיקייה (תיקון הרשאות) ---
-    const downloadFolderZip = async (e, eventName) => {
+    const downloadFolderZip = async (e, folder) => {
         e.stopPropagation();
-        const eventFiles = files.filter(f => f.eventName === eventName);
-        if (eventFiles.length === 0) return alert("תיקייה ריקה");
-        const fileIds = eventFiles.map(f => f._id);
+        const eventFiles = folder.folderFiles;
+        if (!eventFiles || eventFiles.length === 0) return alert("תיקייה ריקה");
 
+        // שמירת הטקסט המקורי של הכפתור ושינויו לסימן טעינה
         const originalText = e.target.innerText;
         e.target.innerText = '⏳';
+
+        const fileIds = eventFiles.map(f => f.id);
 
         try {
             const token = localStorage.getItem('archive_token');
@@ -454,13 +526,20 @@ const uniqueFolders = useMemo(() => {
                 }
             );
             const url = window.URL.createObjectURL(new Blob([response.data]));
-            const link = document.createElement('a'); link.href = url; link.setAttribute('download', `${eventName}.zip`);
-            document.body.appendChild(link); link.click(); link.remove();
+            const link = document.createElement('a');
+            link.href = url;
+            // שימוש ב-folder.eventName במקום eventName שלא מוגדר
+            link.setAttribute('download', `${folder.eventName}.zip`);
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
 
+            // החזרת הטקסט המקורי
             e.target.innerText = originalText;
         } catch (err) {
             console.error(err);
             alert("שגיאה בהורדה. וודא שאתה מחובר.");
+            // החזרת הטקסט המקורי גם במקרה של שגיאה
             e.target.innerText = originalText;
         }
     };
@@ -753,7 +832,7 @@ const uniqueFolders = useMemo(() => {
                 </button>            </div>
 
             {
-viewMode === 'folders' ? (
+                viewMode === 'folders' ? (
                     <div style={styles.grid}>
                         {uniqueFolders.map(folder => {
                             const folderFiles = folder.folderFiles;
@@ -813,7 +892,7 @@ viewMode === 'folders' ? (
                                             try {
                                                 const originalText = e.target.innerText;
                                                 e.target.innerText = '⏳';
-                                                const response = await axios.post(`${API_URL}/api/download-zip`, { fileIds: folderFiles.map(f => f._id) }, { responseType: 'blob', headers: { 'x-access-token': currentToken } });
+                                                const response = await axios.post(`${API_URL}/api/download-zip`, { fileIds: folderFiles.map(f => f.id) }, { responseType: 'blob', headers: { 'x-access-token': currentToken } });
                                                 const url = window.URL.createObjectURL(new Blob([response.data]));
                                                 const link = document.createElement('a'); link.href = url; link.setAttribute('download', `${folder.eventName}.zip`);
                                                 document.body.appendChild(link); link.click(); link.remove();
@@ -828,7 +907,7 @@ viewMode === 'folders' ? (
                                             <button style={{ ...styles.folderActionBtn, position: 'static', background: 'red' }} onClick={async (e) => {
                                                 e.stopPropagation();
                                                 if (!window.confirm(`למחוק את התיקייה הספציפית הזו?`)) return;
-                                                await axios.post(`${API_URL}/api/files/batch-delete`, { ids: folderFiles.map(f => f._id) }, { headers: { 'x-admin-password': adminPassword } });
+                                                await axios.post(`${API_URL}/api/files/batch-delete`, { ids: folderFiles.map(f => f.id) }, { headers: { 'x-admin-password': adminPassword } });
                                                 fetchFiles();
                                             }}>🗑️</button>
                                         </div>
@@ -875,27 +954,50 @@ viewMode === 'folders' ? (
 
                         <div style={styles.grid}>
                             {filteredFiles.map(file => {
-                                const isSelected = selectedFiles.has(file._id);
-                                let filePath = file.thumbnailPath || file.path;
+                                const isSelected = selectedFiles.has(file.id);
+                                const isVideo = file.mimeType && (file.mimeType.startsWith('video') || file.originalName.toLowerCase().endsWith('.mxf'));
+                                const isImage = file.mimeType && file.mimeType.startsWith('image');
+
+                                let displayThumb = file.thumbnailPath;
+                                let displayStream = file.streamPath;
+
+                                // Dynamically derive the thumbnail and stream paths if they are missing from the DB
+                                if (isVideo && file.processingStatus === 'done') {
+                                    const dir = file.path.substring(0, file.path.lastIndexOf('/'));
+                                    if (!displayThumb) displayThumb = `${dir}/thumb_${file.fileHash}.jpg`;
+                                    if (!displayStream) displayStream = `${dir}/stream_${file.fileHash}.mp4`;
+                                }
+
+                                let filePath = displayThumb || file.path;
                                 if (filePath && !filePath.startsWith('storage/')) {
                                     filePath = `storage/${filePath}`;
                                 }
-                                const mediaSrc = `${API_URL}/${filePath}?token=${currentToken}`; return (
-                                    <div key={file._id} style={{ ...styles.fileCard, border: isSelected ? '2px solid #007bff' : styles.fileCard.border }}>
-                                        {(file.mimeType.startsWith('image') || file.thumbnailPath) ? (
-                                            <div style={{ position: 'relative', cursor: 'pointer' }} onClick={() => setPreviewFile(file)}>
-                                                <img src={mediaSrc} alt={file.originalName} style={styles.img} />
-                                                {!file.mimeType.startsWith('image') && (
+
+                                return (
+                                    <div key={file.id} style={{ ...styles.fileCard, border: isSelected ? '2px solid #007bff' : styles.fileCard.border }}>
+                                        {(isImage || (isVideo && displayThumb && file.processingStatus === 'done')) ? (
+                                            <div style={{ position: 'relative', cursor: 'pointer' }} onClick={() => setPreviewFile({ ...file, streamPath: displayStream, thumbnailPath: displayThumb })}>
+                                                <img
+                                                    src={`${API_URL}/${displayThumb || file.path}?token=${currentToken}`}
+                                                    alt={file.originalName}
+                                                    style={styles.img}
+                                                />
+                                                {isVideo && (
                                                     <div style={{ position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', fontSize: '40px', color: 'white', textShadow: '0 0 10px rgba(0,0,0,0.8)' }}>
                                                         ▶️
                                                     </div>
                                                 )}
                                             </div>
                                         ) : (
-                                            <div style={{ ...styles.img, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#333', fontSize: '30px', cursor: 'pointer' }} onClick={() => setPreviewFile(file)}>🎬</div>
+                                            <div style={{ ...styles.img, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#333', fontSize: '30px', cursor: 'pointer' }} onClick={() => {
+                                                if (file.processingStatus === 'done') setPreviewFile({ ...file, streamPath: displayStream, thumbnailPath: displayThumb });
+                                            }}>
+                                                🎬
+                                                <p style={{ fontSize: '10px' }}>{file.processingStatus === 'pending' ? 'מעבד...' : ''}</p>
+                                            </div>
                                         )}
                                         <div style={{ padding: '10px', display: 'flex', justifyContent: 'space-between', background: 'rgba(255,255,255,0.05)' }}>
-                                            <input type="checkbox" checked={isSelected} onChange={() => toggleSelect(file._id)} style={{ transform: 'scale(1.3)', cursor: 'pointer' }} />
+                                            <input type="checkbox" checked={isSelected} onChange={() => toggleSelect(file.id)} style={{ transform: 'scale(1.3)', cursor: 'pointer' }} />
                                             <div style={{ fontSize: '0.8rem', whiteSpace: 'nowrap', overflow: 'hidden', maxWidth: '100px' }}>{file.originalName}</div>
                                         </div>
                                     </div>
@@ -928,7 +1030,7 @@ viewMode === 'folders' ? (
                             <button style={styles.closeBtn} onClick={() => setPreviewFile(null)}>&times;</button>
                             <button style={{ ...styles.navBtn, right: '-100px' }} onClick={(e) => { e.stopPropagation(); navigateLightbox('prev'); }}>❮</button>
 
-                            {previewFile.mimeType.startsWith('image') ? (
+                            {previewFile.mimeType && previewFile.mimeType.startsWith('image') ? (
                                 <img src={`${API_URL}/${previewFile.path}?token=${currentToken}`} style={styles.lightboxImg} alt="Preview" />
                             ) : (
                                 <video controls autoPlay src={`${API_URL}/${previewFile.streamPath || previewFile.path}?token=${currentToken}`} style={styles.lightboxImg} />
@@ -1004,15 +1106,24 @@ viewMode === 'folders' ? (
                                     {Array.isArray(allowedIps) && allowedIps.map(ip => (
                                         <div key={ip} style={{ display: 'flex', justifyContent: 'space-between', background: '#333', padding: '12px 15px', borderRadius: '10px', alignItems: 'center' }}>
                                             <span style={{ fontFamily: 'monospace', fontSize: '1.1rem' }}>{ip}</span>
-                                            {ip !== '127.0.0.1' && ip !== '10.8.52.22' && (
+                                            {ip !== '127.0.0.1' && ip !== '10.100.102.20' && (
                                                 <button onClick={() => handleRemoveIp(ip)} style={{ background: 'none', border: 'none', color: '#ff4d4d', cursor: 'pointer', fontSize: '1.2rem' }}>🗑️</button>
                                             )}
                                         </div>
                                     ))}
                                 </div>
-                                <button onClick={onAddIpClick} style={{ width: '100%', padding: '12px', background: '#28a745', color: 'white', border: 'none', borderRadius: '10px', cursor: 'pointer', fontWeight: 'bold' }}>
-                                    הוסף מחשב חדש
-                                </button>
+                                {/* הוחלף ה-prompt כדי למנוע את תקיעת המקלדת באלקטרון */}
+                                <div style={{ display: 'flex', gap: '10px' }}>
+                                    <input type="text" value={newIpValue} onChange={e => setNewIpValue(e.target.value)} placeholder="הכנס כתובת IP חדשה (למשל 10.8.50.50)" style={{ ...styles.input, flex: 1 }} />
+                                    <button onClick={() => {
+                                        if (!newIpValue) return;
+                                        axios.post(`${API_URL}/api/admin/check-and-add-ip`, { newIp: newIpValue, adminPassword })
+                                            .then(() => { fetchIps(); alert("נוסף בהצלחה"); setNewIpValue(''); })
+                                            .catch(() => alert("שגיאה בהוספה"));
+                                    }} style={{ padding: '12px', background: '#28a745', color: 'white', border: 'none', borderRadius: '10px', cursor: 'pointer', fontWeight: 'bold' }}>
+                                        הוסף מחשב חדש
+                                    </button>
+                                </div>
                             </div>
                         ) : (
                             /* לשונית ניהול כוננים (מקור וגיבוי) */
@@ -1021,87 +1132,100 @@ viewMode === 'folders' ? (
                                 {/* ניהול כונני מקור (Source) */}
                                 <div style={{ background: '#333', padding: '15px', borderRadius: '10px', marginBottom: '20px' }}>
                                     <h4 style={{ marginTop: 0 }}>📂 כונני מקור לסריקה (Source):</h4>
-                                    <div style={{ maxHeight: '150px', overflowY: 'auto', marginBottom: '10px' }}>
-                                        {storageHistory.filter(d => d.type === 'source').map((drive, idx) => (
-                                            <div key={idx} style={{ display: 'flex', justifyContent: 'space-between', padding: '8px', borderBottom: '1px solid #444', alignItems: 'center' }}>
-                                                <span style={{ fontSize: '0.9rem', direction: 'ltr' }}>{drive.path}</span>
-                                                <span style={{ color: drive.status === 'online' ? '#28a745' : '#ff4d4d', fontSize: '0.8rem' }}>
-                                                    {drive.status === 'online' ? `${drive.freeGB}GB פנוי` : 'מנותק'}
-                                                </span>
-                                            </div>
-                                        ))}
+                                    <div style={{ maxHeight: '180px', overflowY: 'auto', marginBottom: '10px', display: 'flex', flexDirection: 'column', gap: '5px' }}>
+                                        {storageHistory.map((drive, idx) => {
+                                            const isCurrent = drive.path === currentStorageRoot;
+                                            return (
+                                                <div key={idx} style={{ display: 'flex', justifyContent: 'space-between', padding: '10px', borderBottom: '1px solid #444', alignItems: 'center', background: isCurrent ? 'rgba(40, 167, 69, 0.2)' : '#222', borderRight: isCurrent ? '4px solid #28a745' : '4px solid transparent', borderRadius: '5px' }}>
+                                                    <span style={{ fontSize: '0.9rem', direction: 'ltr', fontWeight: isCurrent ? 'bold' : 'normal', color: isCurrent ? '#4caf50' : '#ddd' }}>
+                                                        {drive.path} {isCurrent && '(פעיל נוכחי)'}
+                                                    </span>
+                                                    <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
+                                                        <span style={{ color: drive.status === 'online' ? '#aaa' : '#ff4d4d', fontSize: '0.8rem' }}>
+                                                            {drive.status === 'online' ? `${drive.usedGB}GB תפוסים / ${drive.freeGB}GB פנויים` : 'מנותק'}
+                                                        </span>
+                                                        {!isCurrent && drive.status === 'online' && (
+                                                            <button onClick={async () => {
+                                                                try {
+                                                                    await axios.post(`${API_URL}/api/admin/change-drive`, { newPath: drive.path, adminPassword }, { headers: { 'x-access-token': currentToken } });
+                                                                    fetchStorageSettings();
+                                                                } catch (e) { alert("שגיאה בהגדרת הכונן הפעיל"); }
+                                                            }} style={{ padding: '4px 8px', fontSize: '0.75rem', background: '#28a745', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>הפוך לפעיל</button>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                            )
+                                        })}
                                     </div>
-                                    <button
-                                        onClick={async () => {
-                                            const p = prompt("הזן נתיב לכונן מקור חדש (למשל D:/MyArchiveData):");
-                                            if (p) {
+                                    {/* הוחלף ה-prompt */}
+                                    <div style={{ display: 'flex', gap: '10px' }}>
+                                        <input type="text" value={newSourceDriveValue} onChange={e => setNewSourceDriveValue(e.target.value)} placeholder="נתיב לכונן חדש (D:/Archive)" style={{ ...styles.input, flex: 1 }} />
+                                        <button onClick={async () => {
+                                            if (newSourceDriveValue) {
                                                 try {
-                                                    await axios.post(`${API_URL}/api/admin/add-drive`, { path: p, type: 'source' }, { headers: { 'x-access-token': currentToken } });
-                                                    fetchStorageSettings();
-                                                } catch (e) { alert("שגיאה בהוספת כונן"); }
+                                                    await axios.post(`${API_URL}/api/admin/add-drive`, { path: newSourceDriveValue, type: 'source' }, { headers: { 'x-access-token': currentToken } });
+                                                    setNewSourceDriveValue(''); fetchStorageSettings();
+                                                } catch (e) { alert("שגיאה"); }
                                             }
-                                        }}
-                                        style={{ width: '100%', padding: '8px', background: '#007bff', color: 'white', border: 'none', borderRadius: '5px', cursor: 'pointer' }}
-                                    >
-                                        ➕ הוסף כונן מקור חדש
-                                    </button>
+                                        }} style={{ padding: '8px 15px', background: '#007bff', color: 'white', border: 'none', borderRadius: '5px', cursor: 'pointer' }}>➕ הוסף מקור</button>
+                                    </div>
                                 </div>
 
                                 {/* ניהול כונני גיבוי (Backup) */}
                                 <div style={{ background: '#333', padding: '15px', borderRadius: '10px', marginBottom: '20px' }}>
                                     <h4 style={{ marginTop: 0, color: '#17a2b8' }}>🛡️ כונני גיבוי (Backup):</h4>
-                                    <div style={{ maxHeight: '150px', overflowY: 'auto', marginBottom: '10px' }}>
-                                        {storageHistory.filter(d => d.type === 'backup').map((drive, idx) => (
-                                            <div key={idx} style={{ display: 'flex', justifyContent: 'space-between', padding: '8px', borderBottom: '1px solid #444', alignItems: 'center' }}>
-                                                <span style={{ fontSize: '0.9rem', direction: 'ltr' }}>{drive.path}</span>
-                                                <span style={{ color: drive.status === 'online' ? '#17a2b8' : '#ff4d4d', fontSize: '0.8rem' }}>
-                                                    {drive.status === 'online' ? `${drive.freeGB}GB פנוי` : 'מנותק'}
-                                                </span>
-                                            </div>
-                                        ))}
+                                    <div style={{ maxHeight: '180px', overflowY: 'auto', marginBottom: '10px', display: 'flex', flexDirection: 'column', gap: '5px' }}>
+                                        {backupHistory.map((drive, idx) => {
+                                            const isCurrent = drive.path === backupPath;
+                                            return (
+                                                <div key={idx} style={{ display: 'flex', justifyContent: 'space-between', padding: '10px', borderBottom: '1px solid #444', alignItems: 'center', background: isCurrent ? 'rgba(23, 162, 184, 0.2)' : '#222', borderRight: isCurrent ? '4px solid #17a2b8' : '4px solid transparent', borderRadius: '5px' }}>
+                                                    <span style={{ fontSize: '0.9rem', direction: 'ltr', fontWeight: isCurrent ? 'bold' : 'normal', color: isCurrent ? '#17a2b8' : '#ddd' }}>
+                                                        {drive.path} {isCurrent && '(פעיל לגיבוי)'}
+                                                    </span>
+                                                    <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
+                                                        <span style={{ color: drive.status === 'online' ? '#aaa' : '#ff4d4d', fontSize: '0.8rem' }}>
+                                                            {drive.status === 'online' ? `${drive.usedGB}GB תפוסים / ${drive.freeGB}GB פנויים` : 'מנותק'}
+                                                        </span>
+                                                        {!isCurrent && drive.status === 'online' && (
+                                                            <button onClick={async () => {
+                                                                try {
+                                                                    await axios.post(`${API_URL}/api/admin/save-backup-path`, { newBackupPath: drive.path, adminPassword }, { headers: { 'x-access-token': currentToken } });
+                                                                    fetchStorageSettings();
+                                                                } catch (e) { alert("שגיאה"); }
+                                                            }} style={{ padding: '4px 8px', fontSize: '0.75rem', background: '#17a2b8', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>הפוך לפעיל</button>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                            )
+                                        })}
                                     </div>
-                                    <button
-                                        onClick={async () => {
-                                            const p = prompt("הזן נתיב לכונן גיבוי חדש (למשל E:/Backup):");
-                                            if (p) {
+                                    <div style={{ display: 'flex', gap: '10px' }}>
+                                        <input type="text" value={newBackupDriveValue} onChange={e => setNewBackupDriveValue(e.target.value)} placeholder="נתיב לכונן גיבוי חדש (E:/Backup)" style={{ ...styles.input, flex: 1 }} />
+                                        <button onClick={async () => {
+                                            if (newBackupDriveValue) {
                                                 try {
-                                                    await axios.post(`${API_URL}/api/admin/add-drive`, { path: p, type: 'backup' }, { headers: { 'x-access-token': currentToken } });
-                                                    fetchStorageSettings();
-                                                } catch (e) { alert("שגיאה בהוספת כונן"); }
+                                                    await axios.post(`${API_URL}/api/admin/add-drive`, { path: newBackupDriveValue, type: 'backup' }, { headers: { 'x-access-token': currentToken } });
+                                                    setNewBackupDriveValue(''); fetchStorageSettings();
+                                                } catch (e) { alert("שגיאה"); }
                                             }
-                                        }}
-                                        style={{ width: '100%', padding: '8px', background: '#17a2b8', color: 'white', border: 'none', borderRadius: '5px', cursor: 'pointer' }}
-                                    >
-                                        🛡️ הוסף כונן גיבוי חדש
-                                    </button>
+                                        }} style={{ padding: '8px 15px', background: '#17a2b8', color: 'white', border: 'none', borderRadius: '5px', cursor: 'pointer' }}>🛡️ הוסף גיבוי</button>
+                                    </div>
                                 </div>
 
                                 {/* כפתורי פעולה כלליים */}
                                 <hr style={{ borderColor: '#444', margin: '20px 0' }} />
-
-                                <button
-                                    onClick={async () => {
-                                        let pass = prompt("הזן סיסמת מנהל לרענון כללי של הכוננים:");
-                                        if (!pass) return;
-                                        try {
-                                            await axios.post(`${API_URL}/api/admin/refresh-drives`, {}, { headers: { 'x-access-token': currentToken, 'x-admin-password': pass } });
-                                            alert("הרענון הסתיים! כל הקבצים נטענו מחדש מהכוננים המחוברים.");
-                                            fetchFiles();
-                                        } catch (e) { alert("שגיאה ברענון הכוננים"); }
-                                    }}
-                                    style={{ width: '100%', padding: '12px', background: '#e0a800', color: 'black', border: 'none', borderRadius: '10px', cursor: 'pointer', fontWeight: 'bold', marginBottom: '10px' }}>
+                                <button onClick={async () => {
+                                    try {
+                                        await axios.post(`${API_URL}/api/admin/refresh-drives`, {}, { headers: { 'x-access-token': currentToken, 'x-admin-password': adminPassword } });
+                                        alert("הרענון הסתיים! כל הקבצים נטענו מחדש מהכוננים המחוברים.");
+                                        fetchFiles();
+                                    } catch (e) { alert("שגיאה ברענון הכוננים"); }
+                                }} style={{ width: '100%', padding: '12px', background: '#e0a800', color: 'black', border: 'none', borderRadius: '10px', cursor: 'pointer', fontWeight: 'bold', marginBottom: '10px' }}>
                                     🔄 רענון כוננים (סריקה מחדש)
                                 </button>
-
-                                <button
-                                    onClick={handleRunBackup}
-                                    style={{ width: '100%', padding: '12px', background: '#6f42c1', color: 'white', border: 'none', borderRadius: '10px', cursor: 'pointer', fontWeight: 'bold' }}>
+                                <button onClick={handleRunBackup} style={{ width: '100%', padding: '12px', background: '#6f42c1', color: 'white', border: 'none', borderRadius: '10px', cursor: 'pointer', fontWeight: 'bold' }}>
                                     🚀 הפעל גיבוי ידני עכשיו
                                 </button>
-
-                                <p style={{ fontSize: '0.75rem', color: '#888', textAlign: 'center', marginTop: '10px' }}>
-                                    * המערכת מבצעת גיבוי אוטומטי פעם בשבוע לכוננים המוגדרים כ-Backup.
-                                </p>
                             </div>
                         )}
                     </div>
@@ -1141,22 +1265,20 @@ viewMode === 'folders' ? (
 
                         {showAdminMenu && (
                             <>
-                                <Link to="/upload">
-                                    <button
-                                        title="הוספת תמונות"
-                                        style={{
-                                            width: '55px', height: '55px', borderRadius: '50%',
-                                            background: '#28a745', color: 'white', border: 'none',
-                                            cursor: 'pointer', fontSize: '24px', boxShadow: '0 4px 8px rgba(0,0,0,0.3)',
-                                        }}
-                                    >
-                                        ➕
-                                    </button>
-                                </Link>
-
+                                <button
+                                    onClick={() => setIsUploadModalOpen(true)}
+                                    title="הוספת תמונות"
+                                    style={{
+                                        width: '55px', height: '55px', borderRadius: '50%',
+                                        background: '#28a745', color: 'white', border: 'none',
+                                        cursor: 'pointer', fontSize: '24px', boxShadow: '0 4px 8px rgba(0,0,0,0.3)',
+                                    }}
+                                >
+                                    ➕
+                                </button>
                                 <button
                                     onClick={handleIpIconClick}
-                                    title="ניהול IP"
+                                    title="ניהול מתקדם"
                                     style={{
                                         width: '45px', height: '45px', borderRadius: '50%',
                                         background: '#17a2b8', color: 'white', border: 'none',
@@ -1181,7 +1303,24 @@ viewMode === 'folders' ? (
                         )}
                     </div>
                 )
-            }        </div >
+            }
+            {/* חלון ההתראות המרחף (Toasts) */}
+            <div style={{ position: 'fixed', top: '20px', right: '20px', zIndex: 9999, display: 'flex', flexDirection: 'column', gap: '10px', pointerEvents: 'none' }}>
+                {toasts.map(t => (
+                    <div key={t.id} style={{ background: t.type === 'warning' ? '#d32f2f' : '#333', color: 'white', padding: '15px 25px', borderRadius: '10px', boxShadow: '0 5px 15px rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '15px', fontWeight: 'bold', pointerEvents: 'auto' }}>
+                        <span>{t.msg}</span>
+                        <button onClick={() => setToasts(prev => prev.filter(x => x.id !== t.id))} style={{ background: 'none', border: 'none', color: 'white', cursor: 'pointer', fontWeight: 'bold', fontSize: '1.2rem' }}>✕</button>
+                    </div>
+                ))}
+            </div>
+            {isUploadModalOpen && (
+                <div style={styles.lightbox} onClick={() => setIsUploadModalOpen(false)}>
+                    <div style={{ ...styles.lightboxContent, background: 'transparent', padding: '0', maxWidth: '650px', width: '100%', maxHeight: '95vh', overflowY: 'auto' }} onClick={e => e.stopPropagation()}>
+                        <UploadForm onClose={() => setIsUploadModalOpen(false)} />
+                    </div>
+                </div>
+            )}
+        </div >
     );
 }
 

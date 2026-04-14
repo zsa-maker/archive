@@ -26,7 +26,7 @@ function App() {
   const handleLogin = async (e) => {
     e.preventDefault();
     try {
-      const res = await axios.post('http://10.8.52.22:3001/api/login', { username, password });
+      const res = await axios.post('http://10.100.102.20:3001/api/login', { username, password });
       const newToken = res.data.token;
       localStorage.setItem('archive_token', newToken);
       setToken(newToken);
