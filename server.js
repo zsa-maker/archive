@@ -3,7 +3,6 @@ const cors = require('cors');
 const multer = require('multer');
 const crypto = require('crypto');
 const fs = require('fs');
-const path = require('path');
 const ffmpeg = require('fluent-ffmpeg');
 const sharp = require('sharp');
 const Datastore = require('@seald-io/nedb');
@@ -23,7 +22,12 @@ const APP_PASSWORD = 'bist';
 let SESSION_TOKEN = uuidv4();
 
 const app = express();
-const PORT = 3001;
+
+const { app: electronApp } = require('electron');
+const path = require('path');
+
+const userDataPath = electronApp.getPath('userData'); 
+const dbPath = path.join(userDataPath, 'archive.db');
 
 app.use(cors());
 app.use(express.json());
